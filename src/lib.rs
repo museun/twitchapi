@@ -1,12 +1,44 @@
-use ::serde::de::*;
 use serde::{Deserialize, Serialize};
 use std::str::FromStr;
-use time::{OffsetDateTime, PrimitiveDateTime};
+use time::OffsetDateTime;
 
-/// A clonable Twitch API client
-#[derive(Clone)]
-pub struct Client {
-    client: reqwest::Client,
+#[derive(Debug)]
+pub enum Error {
+    Reqwest {
+        error: reqwest::Error,
+    },
+    InvalidClientId {
+        error: reqwest::header::InvalidHeaderValue,
+    },
+    InvalidOAuthToken {
+        error: reqwest::header::InvalidHeaderValue,
+    },
+}
+
+impl From<reqwest::Error> for Error {
+    fn from(error: reqwest::Error) -> Self {
+        Self::Reqwest { error }
+    }
+}
+
+impl std::fmt::Display for Error {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Error::Reqwest { error } => write!(f, "reqwest error: {}", error),
+            Error::InvalidClientId { error } => write!(f, "invalid client id: {}", error),
+            Error::InvalidOAuthToken { error } => write!(f, "invalid oauth token: {}", error),
+        }
+    }
+}
+
+impl std::error::Error for Error {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Error::Reqwest { error } => Some(error),
+            Error::InvalidClientId { error } => Some(error),
+            Error::InvalidOAuthToken { error } => Some(error),
+        }
+    }
 }
 
 /// Users in a channel
@@ -72,25 +104,53 @@ pub struct User {
     pub display_name: String,
 }
 
+/// Required authentication keys
+#[derive(Clone, Debug, PartialEq)]
+pub struct Authenication {
+    /// Your twitch Client-ID
+    pub client_id: String,
+    /// A OAuth token that is associated with the Client-ID
+    pub oauth_token: String,
+}
+
+/// A clonable Twitch API client
+#[derive(Clone)]
+pub struct Client {
+    client: reqwest::Client,
+}
+
 impl Client {
     const BASE_URI: &'static str = "https://api.twitch.tv/helix";
 
-    /// Create a new Twitch API client with the provided Client-ID
-    pub fn new(client_id: &str) -> Self {
-        let client = reqwest::ClientBuilder::new()
+    /// Create a new Twitch API client with the provided `Authenication`
+    pub fn new(auth: impl std::borrow::Borrow<Authenication>) -> Result<Self, Error> {
+        reqwest::ClientBuilder::new()
+            // TODO get this at build-time
             .user_agent("twitchapi/ccd6048 (github.com/museun/twitchapi)")
             .default_headers({
+                let auth = auth.borrow();
                 let mut map = reqwest::header::HeaderMap::new();
-                map.insert("Client-ID", client_id.parse().unwrap());
+                map.insert(
+                    "Client-ID",
+                    auth.client_id
+                        .parse()
+                        .map_err(|error| Error::InvalidClientId { error })?,
+                );
+                map.insert(
+                    "Authorization",
+                    format!("Bearer {}", auth.oauth_token)
+                        .parse()
+                        .map_err(|error| Error::InvalidOAuthToken { error })?,
+                );
                 map
             })
             .build()
-            .unwrap();
-        Self { client }
+            .map_err(Into::into)
+            .map(|client| Self { client })
     }
 
     /// Get a collection of streams for the provided user logins
-    pub async fn get_streams<I>(&self, user_logins: I) -> anyhow::Result<Vec<Stream>>
+    pub async fn get_streams<I>(&self, user_logins: I) -> Result<Vec<Stream>, Error>
     where
         I: IntoIterator,
         I::Item: serde::Serialize,
@@ -100,13 +160,13 @@ impl Client {
             data: Vec<Stream>,
         }
 
-        self.get_response::<Data, _, _>("streams", std::iter::repeat("user_login").zip(user_logins))
+        self.get_response("streams", std::iter::repeat("user_login").zip(user_logins))
             .await
-            .map(|data| data.data)
+            .map(|data: Data| data.data)
     }
 
     /// Get a collection of streams for the provided user ids
-    pub async fn get_streams_from_id<I>(&self, user_ids: I) -> anyhow::Result<Vec<Stream>>
+    pub async fn get_streams_from_id<I>(&self, user_ids: I) -> Result<Vec<Stream>, Error>
     where
         I: IntoIterator,
         I::Item: serde::Serialize,
@@ -116,13 +176,13 @@ impl Client {
             data: Vec<Stream>,
         }
 
-        self.get_response::<Data, _, _>("streams", std::iter::repeat("user_id").zip(user_ids))
+        self.get_response("streams", std::iter::repeat("user_id").zip(user_ids))
             .await
-            .map(|data| data.data)
+            .map(|data: Data| data.data)
     }
 
     /// Get a collection of users for the provided user names
-    pub async fn get_users<I>(&self, user_logins: I) -> anyhow::Result<Vec<User>>
+    pub async fn get_users<I>(&self, user_logins: I) -> Result<Vec<User>, Error>
     where
         I: IntoIterator,
         I::Item: serde::Serialize,
@@ -132,13 +192,13 @@ impl Client {
             data: Vec<User>,
         }
 
-        self.get_response::<Data, _, _>("users", std::iter::repeat("login").zip(user_logins))
+        self.get_response("users", std::iter::repeat("login").zip(user_logins))
             .await
-            .map(|data| data.data)
+            .map(|data: Data| data.data)
     }
 
     /// Get a collection of users for the provided user ids
-    pub async fn get_users_from_id<I>(&self, user_ids: I) -> anyhow::Result<Vec<User>>
+    pub async fn get_users_from_id<I>(&self, user_ids: I) -> Result<Vec<User>, Error>
     where
         I: IntoIterator,
         I::Item: serde::Serialize,
@@ -148,13 +208,13 @@ impl Client {
             data: Vec<User>,
         }
 
-        self.get_response::<Data, _, _>("users", std::iter::repeat("id").zip(user_ids))
+        self.get_response("users", std::iter::repeat("id").zip(user_ids))
             .await
-            .map(|data| data.data)
+            .map(|data: Data| data.data)
     }
 
     /// Get a collection of users for a Twitch channel
-    pub async fn get_users_for(&self, room: &str) -> anyhow::Result<Users> {
+    pub async fn get_users_for(&self, room: &str) -> Result<Users, Error> {
         #[derive(Deserialize)]
         struct Data {
             chatter_count: usize,
@@ -183,7 +243,7 @@ impl Client {
             .map_err(Into::into)
     }
 
-    async fn get_response<'a, T, M, V>(&self, ep: &str, map: M) -> anyhow::Result<T>
+    async fn get_response<'a, T, M, V>(&self, ep: &str, map: M) -> Result<T, Error>
     where
         for<'de> T: serde::Deserialize<'de>,
         M: IntoIterator<Item = (&'a str, V)>,
@@ -203,24 +263,13 @@ impl Client {
     }
 }
 
-/// Deserialize a `time::PrimitiveDateTime`
-fn prim_date_time<'de, D>(deser: D) -> Result<PrimitiveDateTime, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    // TODO borrow this
-    let s = String::deserialize(deser)?;
-    time::parse(&s, "%FT%TZ").map_err(Error::custom)
-}
-
 /// Deserialize a `time::OffsetDateTime` with an assumed ***UTC*** offset
 fn assume_utc_date_time<'de, D>(deser: D) -> Result<OffsetDateTime, D::Error>
 where
-    D: Deserializer<'de>,
+    D: serde::de::Deserializer<'de>,
 {
-    // TODO borrow this
-    let s = String::deserialize(deser)? + " +0000";
-    time::parse(&s, "%FT%TZ %z").map_err(Error::custom)
+    time::parse(&(String::deserialize(deser)? + " +0000"), "%FT%TZ %z")
+        .map_err(serde::de::Error::custom)
 }
 
 /// Deserialize using a `FromStr` impl
@@ -228,9 +277,9 @@ fn from_str<'de, D, T>(deser: D) -> Result<T, D::Error>
 where
     T: FromStr,
     <T as FromStr>::Err: std::fmt::Display,
-    D: Deserializer<'de>,
+    D: serde::de::Deserializer<'de>,
 {
-    // TODO borrow this
-    let s = String::deserialize(deser)?;
-    s.parse().map_err(Error::custom)
+    String::deserialize(deser)?
+        .parse()
+        .map_err(serde::de::Error::custom)
 }
